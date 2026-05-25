@@ -1,4 +1,4 @@
-"""Tiled GEMM: 64x64 tiles, 8 simdgroups, async copy + double buffering.
+"""Tiled GEMM: MPS-shaped 128x128 tiles, 16 simdgroups.
 
 Build:
     mojo build --target-accelerator apple-m1-metal4 gemm_v3.mojo -o gemm_v3
@@ -32,12 +32,16 @@ comptime M = 1024
 comptime N = 1024
 comptime K = 1024
 
-comptime BM = 64
-comptime BN = 64
+comptime BM = 128
+comptime BN = 128
 comptime BK = 32
-comptime NUM_SG = 8
+comptime SG_M = 4
+comptime SG_N = 4
+comptime NUM_SG = SG_M * SG_N
 comptime THREADS = NUM_SG * WARP_SIZE
-comptime TILES_N = BN // 8
+comptime ACC_M = BM // (SG_M * 8)
+comptime ACC_N = BN // (SG_N * 8)
+comptime NUM_ACC = ACC_M * ACC_N
 
 
 # ---- async copy helpers ----------------------------------------------------
@@ -85,6 +89,8 @@ def _wait_async(event_slot: UnsafePointer[Int64, ...]):
 comptime A_LAYOUT = row_major[M, K]()
 comptime B_LAYOUT = row_major[K, N]()
 comptime C_LAYOUT = row_major[M, N]()
+comptime A_SMEM_LAYOUT = row_major[BM, BK]()
+comptime B_SMEM_LAYOUT = row_major[BK, BN]()
 
 
 def kernel(
@@ -97,109 +103,62 @@ def kernel(
     var bi = Int(block_idx.x)
     var bj = Int(block_idx.y)
     var sg_id = Int(thread_idx.x) // WARP_SIZE
+    var sg_m = sg_id // SG_N
+    var sg_n = sg_id % SG_N
 
-    # Double-buffered shared memory
-    var sa0 = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
-        row_major[BM, BK]()
+    var sa = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
+        A_SMEM_LAYOUT
     )
-    var sa1 = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
-        row_major[BM, BK]()
-    )
-    var sb0 = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
-        row_major[BK, BN]()
-    )
-    var sb1 = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
-        row_major[BK, BN]()
+    var sb = stack_allocation[AB_DTYPE, address_space=AddressSpace.SHARED](
+        B_SMEM_LAYOUT
     )
 
-    # Event slot for async wait
-    var event_slot = raw_stack_alloc[1, Int64]()
-    event_slot[0] = external_call["air.get_null_simdgroup_event", Int64]()
+    var event_slots = raw_stack_alloc[2, Int64]()
+    event_slots[0] = external_call["air.get_null_simdgroup_event", Int64]()
+    event_slots[1] = event_slots[0]
 
-    # Accumulators
-    var acc0 = SIMD[C_DTYPE, 2](0)
-    var acc1 = SIMD[C_DTYPE, 2](0)
-    var acc2 = SIMD[C_DTYPE, 2](0)
-    var acc3 = SIMD[C_DTYPE, 2](0)
-    var acc4 = SIMD[C_DTYPE, 2](0)
-    var acc5 = SIMD[C_DTYPE, 2](0)
-    var acc6 = SIMD[C_DTYPE, 2](0)
-    var acc7 = SIMD[C_DTYPE, 2](0)
+    var acc = InlineArray[SIMD[C_DTYPE, 2], NUM_ACC](
+        fill=SIMD[C_DTYPE, 2](0)
+    )
 
     var a_base = a.ptr + bi * BM * K
     var b_base = b.ptr + bj * BN
 
-    # Prefetch first tile into buffer 0
-    if sg_id == 0:
-        event_slot[0] = _async_copy_2d(sa0.ptr, BK, a_base, K, BM, BK)
-    if sg_id == 1:
-        event_slot[0] = _async_copy_2d(sb0.ptr, BN, b_base, N, BK, BN)
-    _wait_async(event_slot)
-    barrier()
-
     comptime NUM_K_TILES = K // BK
+
     for kt_idx in range(NUM_K_TILES):
         var kt = kt_idx * BK
-
-        # Pick current buffer
-        var sa_cur = sa0.ptr if kt_idx % 2 == 0 else sa1.ptr
-        var sb_cur = sb0.ptr if kt_idx % 2 == 0 else sb1.ptr
-
-        # Async prefetch NEXT tile into the other buffer
-        if kt_idx + 1 < NUM_K_TILES:
-            var sa_next = sa1.ptr if kt_idx % 2 == 0 else sa0.ptr
-            var sb_next = sb1.ptr if kt_idx % 2 == 0 else sb0.ptr
-            var next_kt = kt + BK
-            if sg_id == 0:
-                event_slot[0] = _async_copy_2d(
-                    sa_next, BK, a_base + next_kt, K, BM, BK
-                )
-            if sg_id == 1:
-                event_slot[0] = _async_copy_2d(
-                    sb_next, BN, b_base + next_kt * N, N, BK, BN
-                )
-
-        # Compute on current tile
-        comptime for kk in range(BK // 8):
-            var a_frag = simdgroup_load(
-                sa_cur + sg_id * 8 * BK + kk * 8, BK
-            )
-
-            comptime for tj in range(TILES_N):
-                var b_frag = simdgroup_load(
-                    sb_cur + kk * 8 * BN + tj * 8, BN
-                )
-                if tj == 0:
-                    acc0 = simdgroup_multiply_accumulate(a_frag, b_frag, acc0)
-                elif tj == 1:
-                    acc1 = simdgroup_multiply_accumulate(a_frag, b_frag, acc1)
-                elif tj == 2:
-                    acc2 = simdgroup_multiply_accumulate(a_frag, b_frag, acc2)
-                elif tj == 3:
-                    acc3 = simdgroup_multiply_accumulate(a_frag, b_frag, acc3)
-                elif tj == 4:
-                    acc4 = simdgroup_multiply_accumulate(a_frag, b_frag, acc4)
-                elif tj == 5:
-                    acc5 = simdgroup_multiply_accumulate(a_frag, b_frag, acc5)
-                elif tj == 6:
-                    acc6 = simdgroup_multiply_accumulate(a_frag, b_frag, acc6)
-                else:
-                    acc7 = simdgroup_multiply_accumulate(a_frag, b_frag, acc7)
-
-        # Wait for prefetch before swapping buffers
-        if kt_idx + 1 < NUM_K_TILES:
-            _wait_async(event_slot)
+        event_slots[0] = _async_copy_2d(sa.ptr, BK, a_base + kt, K, BM, BK)
+        event_slots[1] = _async_copy_2d(
+            sb.ptr, BN, b_base + kt * N, N, BK, BN
+        )
+        _wait_async(event_slots)
+        _wait_async(event_slots + 1)
         barrier()
 
-    var c_base = c.ptr + (bi * BM + sg_id * 8) * N + bj * BN
-    simdgroup_store(acc0, c_base + 0,  N)
-    simdgroup_store(acc1, c_base + 8,  N)
-    simdgroup_store(acc2, c_base + 16, N)
-    simdgroup_store(acc3, c_base + 24, N)
-    simdgroup_store(acc4, c_base + 32, N)
-    simdgroup_store(acc5, c_base + 40, N)
-    simdgroup_store(acc6, c_base + 48, N)
-    simdgroup_store(acc7, c_base + 56, N)
+        comptime for kk in range(BK // 8):
+            comptime for mi in range(ACC_M):
+                var a_row = (sg_m + mi * SG_M) * 8
+                var a_frag = simdgroup_load(sa.ptr + a_row * BK + kk * 8, BK)
+
+                comptime for nj in range(ACC_N):
+                    var b_col = (sg_n + nj * SG_N) * 8
+                    var b_frag = simdgroup_load(
+                        sb.ptr + kk * 8 * BN + b_col, BN
+                    )
+                    comptime acc_idx = mi * ACC_N + nj
+                    acc[acc_idx] = simdgroup_multiply_accumulate(
+                        a_frag, b_frag, acc[acc_idx]
+                    )
+        barrier()
+
+    var c_base = c.ptr + bi * BM * N + bj * BN
+    comptime for mi in range(ACC_M):
+        var c_row = (sg_m + mi * SG_M) * 8
+        comptime for nj in range(ACC_N):
+            var c_col = (sg_n + nj * SG_N) * 8
+            comptime acc_idx = mi * ACC_N + nj
+            simdgroup_store(acc[acc_idx], c_base + c_row * N + c_col, N)
 
 
 def main() raises:
