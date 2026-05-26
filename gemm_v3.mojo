@@ -1,5 +1,7 @@
 """Tiled GEMM: MPS-shaped 128x128 tiles, 16 simdgroups.
 
+Run:
+    mojo run --target-accelerator apple-m1-metal4 gemm_v3.mojo
 Build:
     mojo build --target-accelerator apple-m1-metal4 gemm_v3.mojo -o gemm_v3
 """
@@ -46,6 +48,7 @@ comptime NUM_ACC = ACC_M * ACC_N
 
 # ---- async copy helpers ----------------------------------------------------
 
+
 @always_inline
 def _async_copy_2d[
     dtype: DType
@@ -79,9 +82,7 @@ def _async_copy_2d[
 
 @always_inline
 def _wait_async(event_slot: UnsafePointer[Int64, ...]):
-    external_call["air.wait_simdgroup_events", NoneType](
-        Int32(1), event_slot
-    )
+    external_call["air.wait_simdgroup_events", NoneType](Int32(1), event_slot)
 
 
 # ---- kernel ----------------------------------------------------------------
@@ -117,9 +118,7 @@ def kernel(
     event_slots[0] = external_call["air.get_null_simdgroup_event", Int64]()
     event_slots[1] = event_slots[0]
 
-    var acc = InlineArray[SIMD[C_DTYPE, 2], NUM_ACC](
-        fill=SIMD[C_DTYPE, 2](0)
-    )
+    var acc = InlineArray[SIMD[C_DTYPE, 2], NUM_ACC](fill=SIMD[C_DTYPE, 2](0))
 
     var a_base = a.ptr + bi * BM * K
     var b_base = b.ptr + bj * BN
@@ -129,9 +128,7 @@ def kernel(
     for kt_idx in range(NUM_K_TILES):
         var kt = kt_idx * BK
         event_slots[0] = _async_copy_2d(sa.ptr, BK, a_base + kt, K, BM, BK)
-        event_slots[1] = _async_copy_2d(
-            sb.ptr, BN, b_base + kt * N, N, BK, BN
-        )
+        event_slots[1] = _async_copy_2d(sb.ptr, BN, b_base + kt * N, N, BK, BN)
         _wait_async(event_slots)
         _wait_async(event_slots + 1)
         barrier()
@@ -188,7 +185,9 @@ def main() raises:
         var ct = TileTensor(cb, C_LAYOUT)
 
         ctx.enqueue_function[kernel, kernel](
-            at, bt, ct,
+            at,
+            bt,
+            ct,
             grid_dim=(M // BM, N // BN),
             block_dim=THREADS,
         )
@@ -200,9 +199,10 @@ def main() raises:
                 for j in range(N):
                     var expected: Scalar[C_DTYPE] = 0
                     for k in range(K):
-                        expected += a_h[i, k].cast[C_DTYPE]() * b_h[
-                            k, j
-                        ].cast[C_DTYPE]()
+                        expected += (
+                            a_h[i, k].cast[C_DTYPE]()
+                            * b_h[k, j].cast[C_DTYPE]()
+                        )
                     var diff = expected - r[i, j]
                     if diff > 0.1 or diff < -0.1:
                         print(
@@ -214,7 +214,9 @@ def main() raises:
 
         for _ in range(5):
             ctx.enqueue_function[kernel, kernel](
-                at, bt, ct,
+                at,
+                bt,
+                ct,
                 grid_dim=(M // BM, N // BN),
                 block_dim=THREADS,
             )
@@ -223,7 +225,9 @@ def main() raises:
         var t0 = perf_counter_ns()
         for _ in range(100):
             ctx.enqueue_function[kernel, kernel](
-                at, bt, ct,
+                at,
+                bt,
+                ct,
                 grid_dim=(M // BM, N // BN),
                 block_dim=THREADS,
             )
@@ -232,7 +236,13 @@ def main() raises:
 
         var avg = ns / 100
         print(
-            "PASS", M, "x", N, "|",
-            FLOPS / Float64(avg), "GFLOPS |",
-            Float64(avg) / 1e6, "ms",
+            "PASS",
+            M,
+            "x",
+            N,
+            "|",
+            FLOPS / Float64(avg),
+            "GFLOPS |",
+            Float64(avg) / 1e6,
+            "ms",
         )
